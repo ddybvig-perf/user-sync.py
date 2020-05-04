@@ -18,26 +18,34 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-import argparse
 import logging
 import os
-import sys
-import click
 import shutil
-from click_default_group import DefaultGroup
+import sys
 from datetime import datetime
 
+import click
 import six
+from click_default_group import DefaultGroup
 
+import user_sync.certgen
+import user_sync.cli
+import user_sync.cli
 import user_sync.config
 import user_sync.connector.directory
+import user_sync.connector.directory_csv
+import user_sync.connector.directory_ldap
+import user_sync.connector.directory_okta
 import user_sync.connector.umapi
+import user_sync.connector.umapi
+import user_sync.encryption
 import user_sync.helper
 import user_sync.lockfile
-import user_sync.rules
-import user_sync.cli
 import user_sync.resource
+import user_sync.rules
+from user_sync.credentials import CredentialManager
 from user_sync.error import AssertionException
+from user_sync.post_sync.manager import PostSyncManager
 from user_sync.version import __version__ as app_version
 
 LOG_STRING_FORMAT = '%(asctime)s %(process)d %(levelname)s %(name)s - %(message)s'
@@ -45,6 +53,14 @@ LOG_DATE_FORMAT = '%Y-%m-%d %H:%M:%S'
 
 # file logger, defined early so later functions can refer to it.
 logger = logging.getLogger('main')
+
+
+def init_cli_logger():
+    # Removes the LOG_STRING_FORMAT and LOG_DATE_FORMAT from the logger
+    # so that additional tools like credential manager can produce uniform output
+    # along side click I/O. Console log level is INFO by default, but can be overwritten in user_sync_config.yml
+    logging.getLogger().handlers[0].setFormatter(logging.Formatter('', ''))
+    logging.getLogger().setLevel(logging.INFO)
 
 
 def init_console_log():
@@ -157,6 +173,9 @@ def main():
 def sync(**kwargs):
     """Run User Sync [default command]"""
     run_stats = None
+    sign_config_file = kwargs.get('sign_sync_config')
+    if 'sign_sync_config' in kwargs:
+        del (kwargs['sign_sync_config'])
     try:
         # load the config files and start the file logger
         config_loader = user_sync.config.ConfigLoader(kwargs)
@@ -198,6 +217,28 @@ def sync(**kwargs):
             run_stats.log_end(logger)
 
 
+@main.command(help='Generates configuration files, an X509 certificate/keypair, and the batch '
+                   'files for running the user-sync tool in test and live mode.')
+@click.pass_context
+def init(ctx):
+    ctx.forward(certgen, randomize=True)
+
+    with open('Run_UST_Test_Mode.bat', 'w') as OPATH:
+        OPATH.writelines(['mode 155,50', '\ncd /D "%~dp0"', '\nuser-sync.exe --process-groups --users mapped -t',
+                          '\npause'])
+    with open("Run_UST_Live.bat", 'w') as OPATH:
+        OPATH.writelines(
+            ['mode 155,50', '\ncd /D "%~dp0"', '\nuser-sync.exe --process-groups --users mapped'])
+
+    sync = 'user-sync-config.yml'
+    umapi = 'connector-umapi.yml'
+    ldap = 'connector-ldap.yml'
+    existing = "\n".join({f for f in (sync, umapi, ldap) if os.path.exists(f)})
+    if existing and not click.confirm('\nWarning: files already exist: \n{}\nOverwrite?'.format(existing)):
+        return
+    ctx.forward(example_config, root=sync, umapi=umapi, ldap=ldap)
+
+
 @main.command()
 @click.help_option('-h', '--help')
 @click.option('--root', help="Filename of root user sync config file",
@@ -219,7 +260,24 @@ def example_config(**kwargs):
         res_file = user_sync.resource.get_resource(res_files[k])
         assert res_file is not None, "Resource file '{}' not found".format(res_files[k])
         click.echo("Generating file '{}'".format(fname))
-        shutil.copy(res_file, fname)
+        with open(res_file, 'r') as file:
+            content = file.read()
+        with open(fname, 'w') as file:
+            file.write(content)
+
+
+@main.command()
+@click.help_option('-h', '--help')
+@click.option('--filename', help="Filename of Sign Sync config",
+              prompt='Sign Sync Config Filename', default='connector-sign-sync.yml')
+def example_config_sign(filename):
+    """Generate Sign Sync Config"""
+    res_filename = os.path.join('examples', 'connector-sign-sync.yml')
+
+    res_file = user_sync.resource.get_resource(res_filename)
+    assert res_file is not None, "Resource file '{}' not found".format(res_filename)
+    click.echo("Generating file '{}'".format(filename))
+    shutil.copy(res_file, filename)
 
 
 @main.command()
@@ -323,6 +381,16 @@ def begin_work(config_loader):
         directory_connector = user_sync.connector.directory.DirectoryConnector(directory_connector_module)
         directory_connector_options = config_loader.get_directory_connector_options(directory_connector.name)
 
+    post_sync_manager = None
+    # get post-sync config unconditionally so we don't get an 'unused key' error
+    post_sync_config = config_loader.get_post_sync_options()
+    if rule_config['strategy'] == 'sync':
+        if post_sync_config:
+            post_sync_manager = PostSyncManager(post_sync_config, rule_config['test_mode'])
+            rule_config['extended_attributes'] |= post_sync_manager.get_directory_attributes()
+    else:
+        logger.warn('Post-Sync Connectors only support "sync" strategy')
+
     config_loader.check_unused_config_keys()
 
     if directory_connector is not None and directory_connector_options is not None:
@@ -337,7 +405,10 @@ def begin_work(config_loader):
         additional_group_filters = [r['source'] for r in additional_groups]
     if directory_connector is not None:
         directory_connector.state.additional_group_filters = additional_group_filters
-
+        # show error dynamic mappings enabled but 'dynamic_group_member_attribute' is not defined
+        if additional_group_filters and directory_connector.state.options['dynamic_group_member_attribute'] is None:
+            raise AssertionException(
+                "Failed to enable dynamic group mappings. 'dynamic_group_member_attribute' is not defined in config")
     primary_name = '.primary' if secondary_umapi_configs else ''
     umapi_primary_connector = user_sync.connector.umapi.UmapiConnector(primary_name, primary_umapi_config)
     umapi_other_connectors = {}
@@ -351,6 +422,202 @@ def begin_work(config_loader):
     if len(directory_groups) == 0 and rule_processor.will_process_groups():
         logger.warning('No group mapping specified in configuration but --process-groups requested on command line')
     rule_processor.run(directory_groups, directory_connector, umapi_connectors)
+
+    #  Post sync section
+    if post_sync_manager:
+        post_sync_manager.run(rule_processor.post_sync_data)
+
+
+@click.group()
+@click.help_option('-h', '--help')
+def credentials():
+    init_cli_logger()
+    click.echo('Using keyring: ' + CredentialManager.keyring_name)
+    pass
+
+
+def log_credentials(credentials, show_values=False):
+    for file, cred in credentials.items():
+        click.echo('\n' + file.split(os.sep)[-1] + ":")
+        for k, v in cred.items():
+            click.echo("  " + k + (": " + v if show_values else ""))
+
+
+@credentials.command(
+    help="Stores all sensitive fields and updates configuration files, replacing plaintext values with keys")
+@click.option('-c', '--config-filename',
+              help="path to your main configuration file",
+              type=str,
+              nargs=1,
+              default="user-sync-config.yml",
+              metavar='path-to-file')
+@click.option('-t', '--type',
+              help=" Specify all, ldap, umapi, okta, console. ",
+              type=str,
+              nargs=1,
+              default="all",
+              metavar='all|ldap|umapi|okta|console')
+def store(config_filename, type):
+    """
+    Stores secure credentials in the configuration file. This is an automated process.
+    """
+    click.echo()
+    stored = CredentialManager(config_filename, type).store()
+    if stored:
+        click.echo("The following keys were stored:")
+        log_credentials(stored)
+    else:
+        click.echo("No keys were stored because no valid credentials were found.")
+
+
+@credentials.command(help="Will return configuration file to unsecured state and replace all secure values with "
+                          "plain text values.")
+@click.option('-c', '--config-filename',
+              help="path to your main configuration file",
+              type=str,
+              nargs=1,
+              default="user-sync-config.yml",
+              metavar='path-to-file')
+@click.option('-t', '--type',
+              help=" Specify all, ldap, umapi, okta, console. ",
+              type=str,
+              nargs=1,
+              default="all",
+              metavar='all|ldap|umapi|okta|console')
+def revert(config_filename, type):
+    """
+    Revert updates config files with actual plaintext data. This is an automated process.
+    """
+    reverted = CredentialManager(config_filename, type).revert()
+    if reverted:
+        click.echo("The following keys were reverted to plaintext:")
+        log_credentials(reverted)
+    else:
+        click.echo("No keys were reverted because no valid identifiers were stored.")
+
+
+@credentials.command(help="Will get the stored credentials without altering config files")
+@click.option('-c', '--config-filename',
+              help="path to your main configuration file",
+              type=str,
+              nargs=1,
+              default="user-sync-config.yml",
+              metavar='path-to-file')
+@click.option('-t', '--type',
+              help=" Specify all, ldap, umapi, okta, console. ",
+              type=str,
+              nargs=1,
+              default="all",
+              metavar='all|ldap|umapi|okta|console')
+def retrieve(config_filename, type):
+    """
+    Fetch and display currently stored credentials
+    """
+    retrieved = CredentialManager(config_filename, type).retrieve()
+    if not retrieved:
+        click.echo("No credentials currently stored with valid identifiers.")
+    log_credentials(retrieved, show_values=True)
+
+
+@credentials.command(help="Allows for easy fetch of stored credentials on any platform.", name="get")
+@click.option('-i', '--identifier', prompt='Enter identifier',
+              help="Name of service you want to get a value for.  Username will always be 'user_sync'.")
+def get_credential(identifier):
+    """
+    Gets the specified credentials from keyring
+    """
+    try:
+        credential_manager = CredentialManager()
+        click.echo("Using backend: " + credential_manager.keyring_name)
+        click.echo("Getting '{0}' from keyring".format(identifier))
+        credential = credential_manager.get(identifier)
+        if credential is None:
+            raise AssertionException("Credential not found for identifier '{0}'".format(identifier))
+        click.echo(identifier + ': ' + credential)
+    except AssertionException as e:
+        click.echo(str(e))
+
+
+@credentials.command(help="Allows for easy setting of credentials on any platform.", name="set")
+@click.option('-i', '--identifier', prompt='Enter identifier',
+              help="Name of service you want to store a value for. You will be prompted for this if not specified."
+                   "Username will always be 'user_sync'. ")
+@click.option('-v', '--value', prompt="Enter value", hide_input=True,
+              help="The value to be stored. You will be prompted for this if not specified.  "
+                   "Username will always be 'user_sync'.")
+def set_credential(identifier, value):
+    """
+    Sets the specified credentials in keyring
+    """
+    credential_manager = CredentialManager()
+    click.echo("Using backend: " + credential_manager.keyring_name)
+    click.echo("Setting '{0}' in keyring".format(identifier))
+    credential_manager.set(identifier, value)
+    click.echo("Validating...")
+    result = credential_manager.get(identifier)
+    if result != value:
+        click.echo("Failed to set credential correctly, stored value was " + str(result))
+    else:
+        click.echo("Credentials stored successfully for: " + identifier)
+
+
+main.add_command(credentials)
+
+
+@main.command(help='Encrypt an existing RSA private key file with a passphrase')
+@click.argument('key-path', default='private.key', type=click.Path(exists=True))
+@click.option('--password', '-p', prompt='Create password', hide_input=True, confirmation_prompt=True)
+def encrypt(password, key_path):
+    try:
+        data = user_sync.encryption.encrypt_file(password, key_path)
+        user_sync.encryption.write_key(data, key_path)
+        click.echo('Encryption was successful.\n{0}'.format(os.path.abspath(key_path)))
+    except AssertionException as e:
+        click.echo(str(e))
+
+
+@main.command(help='Decrypt an RSA private key file with a passphrase')
+@click.argument('key-path', default='private.key', type=click.Path(exists=True))
+@click.option('--password', '-p', prompt='Enter password', hide_input=True)
+def decrypt(password, key_path):
+    try:
+        data = user_sync.encryption.decrypt_file(password, key_path)
+        user_sync.encryption.write_key(data, key_path)
+        click.echo('Decryption was successful.\n{0}'.format(os.path.abspath(key_path)))
+    except AssertionException as e:
+        click.echo(str(e))
+
+
+@main.command(help='Generates an X509 certificate/keypair with random or user-specified subject. '
+                   'User Sync Tool can use these files to communicate with the admin console. '
+                   'Please visit https://console.adobe.io to complete the integration process. '
+                   'Use the --randomize argument to create a secure keypair with no user input.')
+@click.option('--overwrite', '-o', '-y', help='Overwrite existing files without being asked to confirm', is_flag=True)
+@click.option('--randomize', '-r', help='Randomize the values rather than entering credentials', is_flag=True)
+@click.option('--key', '-k', help='Set a custom output path for private key', default='private.key')
+@click.option('--certificate', '-c', help='Set a custom output path for certificate', default='certificate_pub.crt')
+def certgen(randomize, key, certificate, overwrite):
+    key = os.path.abspath(key)
+    certificate = os.path.abspath(certificate)
+    existing = "\n".join({f for f in (key, certificate) if os.path.exists(f)})
+    if existing and not overwrite:
+        if not click.confirm('\nWarning: files already exist: \n{}\nOverwrite?'.format(existing)):
+            return
+    try:
+        if randomize:
+            click.echo("\nSkipping user input due to --randomize flag")
+        else:
+            click.echo(
+                "\nEnter information as required to generate the X509 certificate/key pair for your organization. "
+                "This information is used only for authentication with UMAPI and does not need to reflect "
+                "an SSL or other official identity.  Specify values as you deem fit.\n")
+        subject_fields = user_sync.certgen.get_subject_fields(randomize)
+        user_sync.certgen.generate(key, certificate, subject_fields)
+        click.echo("----------------------------------------------------")
+        click.echo("Success! Files were created at:\n{0}\n{1}".format(key, certificate))
+    except AssertionException as e:
+        click.echo("Error creating keypair: " + str(e))
+        click.echo('Files have not been created/overwritten.')
 
 
 if __name__ == '__main__':

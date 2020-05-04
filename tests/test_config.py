@@ -4,8 +4,9 @@ import yaml
 import shutil
 from util import update_dict
 from user_sync.config import ConfigFileLoader, ConfigLoader, DictConfig
-from user_sync import app
+from user_sync import flags
 from user_sync.error import AssertionException
+from user_sync.credentials import CredentialConfig, CredentialManager
 
 
 def load_ldap_config_options(args):
@@ -22,29 +23,10 @@ def load_ldap_config_options(args):
 
 
 @pytest.fixture
-def root_config_file(fixture_dir):
-    return os.path.join(fixture_dir, 'user-sync-config.yml')
-
-
-@pytest.fixture
-def ldap_config_file(fixture_dir):
-    return os.path.join(fixture_dir, 'connector-ldap.yml')
-
-
-@pytest.fixture
-def umapi_config_file(fixture_dir):
-    return os.path.join(fixture_dir, 'connector-umapi.yml')
-
-
-@pytest.fixture
-def tmp_config_files(root_config_file, ldap_config_file, umapi_config_file, tmpdir):
-    tmpfiles = []
-    for fname in [root_config_file, ldap_config_file, umapi_config_file]:
-        basename = os.path.split(fname)[-1]
-        tmpfile = os.path.join(str(tmpdir), basename)
-        shutil.copy(fname, tmpfile)
-        tmpfiles.append(tmpfile)
-    return tuple(tmpfiles)
+def tmp_extension_config(extension_config_file, tmpdir):
+    tmpfile = os.path.join(str(tmpdir), os.path.split(extension_config_file)[-1])
+    shutil.copy(extension_config_file, tmpfile)
+    return tmpfile
 
 
 @pytest.fixture
@@ -162,3 +144,88 @@ def test_adobe_users_config(tmp_config_files, modify_root_config, cli_args):
     options = config_loader.load_invocation_options()
     assert 'adobe_users' in options
     assert options['adobe_users'] == ['mapped']
+
+
+def test_extension_load(tmp_config_files, modify_root_config, cli_args, tmp_extension_config, monkeypatch):
+    """Test that extension config is loaded when config option is specified"""
+    with monkeypatch.context() as m:
+        m.setattr(flags, 'get_flag', lambda *a: True)
+        (root_config_file, _, _) = tmp_config_files
+
+        args = cli_args({'config_filename': root_config_file})
+        options = ConfigLoader(args).get_rule_options()
+        assert 'after_mapping_hook' in options and options['after_mapping_hook'] is None
+
+        modify_root_config(['directory_users', 'extension'], tmp_extension_config)
+        options = ConfigLoader(args).get_rule_options()
+        assert 'after_mapping_hook' in options and options['after_mapping_hook'] is not None
+
+
+def test_extension_flag(tmp_config_files, modify_root_config, cli_args, tmp_extension_config, monkeypatch):
+    """Test that extension flag will prevent after-map hook from running"""
+    with monkeypatch.context() as m:
+        m.setattr(flags, 'get_flag', lambda *a: False)
+
+        (root_config_file, _, _) = tmp_config_files
+
+        args = cli_args({'config_filename': root_config_file})
+        modify_root_config(['directory_users', 'extension'], tmp_extension_config)
+        options = ConfigLoader(args).get_rule_options()
+        assert 'after_mapping_hook' in options and options['after_mapping_hook'] is None
+
+
+def test_shell_exec_flag(tmp_config_files, modify_root_config, cli_args, monkeypatch):
+    """Test that shell exec flag will raise an error if command is specified to get connector config"""
+    from user_sync.connector.directory import DirectoryConnector
+
+    with monkeypatch.context() as m:
+        m.setattr(flags, 'get_flag', lambda *a: False)
+        (root_config_file, _, _) = tmp_config_files
+
+        args = cli_args({'config_filename': root_config_file})
+        modify_root_config(['directory_users', 'connectors', 'ldap'], "$(some command)")
+        config_loader = ConfigLoader(args)
+
+        directory_connector_module_name = config_loader.get_directory_connector_module_name()
+        if directory_connector_module_name is not None:
+            directory_connector_module = __import__(directory_connector_module_name, fromlist=[''])
+            directory_connector = DirectoryConnector(directory_connector_module)
+            with pytest.raises(AssertionException):
+                config_loader.get_directory_connector_options(directory_connector.name)
+
+
+def test_get_credential_new_format(tmp_config_files):
+    (root_config_file, ldap_config_file, umapi_config_file) = tmp_config_files
+    credman = CredentialManager()
+    ldap_config = ConfigFileLoader.load_from_yaml(ldap_config_file, {})
+    ldap_dict_config = DictConfig('testscope', ldap_config)
+    # make sure it still works in plaintext format
+    assert ldap_dict_config.get_credential('password', 'user_sync') == 'password'
+    ldap_config['password'] = {'secure': 'ldap_key'}
+    credman.set('ldap_key', 'test_password')
+    # make sure get_cred still works when passed in a dict with a valid identifier
+    assert ldap_dict_config.get_credential('password', 'user_sync') == 'test_password'
+    # if the identifier is invalid it should throw an exception
+    ldap_config['password'] = {'secure': 'invalid_identifier'}
+    with pytest.raises(AssertionException):
+        ldap_dict_config.get_credential('password', 'user_sync')
+    # check for exception to be thrown if there is no value for 'password'
+    ldap_config['password'] = None
+    with pytest.raises(AssertionException):
+        ldap_dict_config.get_credential('password', 'user_sync')
+
+
+def test_get_credential_old_format(tmp_config_files):
+    (root_config_file, ldap_config_file, umapi_config_file) = tmp_config_files
+    credman = CredentialManager()
+    ldap_config = ConfigFileLoader.load_from_yaml(ldap_config_file, {})
+    ldap_dict_config = DictConfig('testscope', ldap_config)
+    # adding the secure key format without removing the plain format should throw an exception
+    ldap_config['secure_password_key'] = 'ldap_secure_identifier'
+    with pytest.raises(AssertionException):
+        ldap_dict_config.get_credential('password', 'user_sync')
+    username = ldap_config['username']
+    credman.set('ldap_secure_identifier', 'test_password', username)
+    # set the plain key to None so get_credential will look for the secure_password_key format
+    ldap_config['password'] = None
+    assert ldap_dict_config.get_credential('password', username) == 'test_password'

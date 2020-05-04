@@ -22,7 +22,7 @@ import codecs
 import logging
 import os
 import re
-import subprocess
+from copy import deepcopy
 
 import six
 import yaml
@@ -31,7 +31,9 @@ import user_sync.helper
 import user_sync.identity_type
 import user_sync.port
 import user_sync.rules
+from user_sync import flags
 from user_sync.error import AssertionException
+import user_sync.post_sync.connectors as post_sync_connectors
 
 
 class ConfigLoader(object):
@@ -57,7 +59,7 @@ class ConfigLoader(object):
         'test_mode': False,
         'update_user_info': False,
         'user_filter': None,
-        'users': ['all'],
+        'users': ['all']
     }
 
     def __init__(self, args):
@@ -97,7 +99,7 @@ class ConfigLoader(object):
 
         # copy instead of direct assignment to preserve original invocation_defaults object
         # otherwise, setting options also sets invocation_defaults (same memory ref)
-        options = self.invocation_defaults.copy()
+        options = deepcopy(self.invocation_defaults)
 
         # get overrides from the main config
         invocation_config = self.main_config.get_dict_config('invocation_defaults', True)
@@ -247,6 +249,7 @@ class ConfigLoader(object):
                     options['adobe_group_filter'].append(user_sync.rules.AdobeGroup.create(group))
             else:
                 raise AssertionException('Unknown option "%s" for adobe-users' % adobe_users_action)
+
         return options
 
     def get_logging_config(self):
@@ -384,6 +387,39 @@ class ConfigLoader(object):
                         raise AssertionError("No after_mapping_hook found in extension configuration")
         return options
 
+    def get_post_sync_options(self):
+        """
+        Read the post_sync options from main_config_file, if there are any modules specified, and return its dictionary of options
+        :return: dict
+        """
+
+        ps_opts = self.main_config.get_dict_config('post_sync', True)
+        if not ps_opts:
+            return
+
+        connectors = ps_opts.get_dict('connectors')
+        module_list = ps_opts.get_list('modules')
+        allowed_modules = post_sync_connectors.valid_connectors()
+        post_sync_modules = {}
+
+        try:
+            for m in module_list:
+                if m in post_sync_modules:
+                    raise AssertionException("Duplicate module specified: " + m)
+                elif m not in allowed_modules:
+                    raise AssertionException(
+                        'Unknown post-sync module: {0} - available are: {1}'.format(m, allowed_modules))
+                post_sync_modules[m] = self.get_dict_from_sources([connectors.pop(m)])
+        except KeyError as e:
+            raise AssertionException("Error! Post-sync module " + str(e) + " specified without a configuration file...")
+
+        if connectors:
+            self.logger.warning("Unused post-sync configuration file: " + str(connectors))
+
+        return {
+            'modules': post_sync_modules,
+        }
+
     @staticmethod
     def as_list(value):
         if value is None:
@@ -443,7 +479,7 @@ class ConfigLoader(object):
         """
         Return a dict representing options for RuleProcessor.
         """
-        options = user_sync.rules.RuleProcessor.default_options
+        options = deepcopy(user_sync.rules.RuleProcessor.default_options)
         options.update(self.invocation_options)
 
         # process directory configuration options
@@ -517,8 +553,8 @@ class ConfigLoader(object):
 
         # get the limits
         limits_config = self.main_config.get_dict_config('limits')
-        max_missing = limits_config.get_value('max_adobe_only_users',(int, str),False)
-        percent_pattern = re.compile("(\d*(\.\d+)?%)")
+        max_missing = limits_config.get_value('max_adobe_only_users', (int, str), False)
+        percent_pattern = re.compile(r"(\d*(\.\d+)?%)")
         if isinstance(max_missing, str) and percent_pattern.match(max_missing):
             max_missing_percent = float(max_missing.strip('%'))
             if 0.0 <= max_missing_percent <= 100.0:
@@ -533,10 +569,13 @@ class ConfigLoader(object):
 
         # now get the directory extension, if any
         extension_config = self.get_directory_extension_options()
-        if extension_config:
+        options['extension_enabled'] = flags.get_flag('UST_EXTENSION')
+        if extension_config and not options['extension_enabled']:
+            self.logger.warning('Extension config functionality is disabled - skipping after-map hook')
+        elif extension_config:
             after_mapping_hook_text = extension_config.get_string('after_mapping_hook')
             options['after_mapping_hook'] = compile(after_mapping_hook_text, '<per-user after-mapping-hook>', 'exec')
-            options['extended_attributes'] = extension_config.get_list('extended_attributes', True) or []
+            options['extended_attributes'].update(extension_config.get_list('extended_attributes', True))
             # declaration of extended adobe groups: this is needed for two reasons:
             # 1. it allows validation of group names, and matching them to adobe groups
             # 2. it allows removal of adobe groups not assigned by the hook
@@ -775,58 +814,50 @@ class DictConfig(ObjectConfig):
     keyring_prefix = 'secure_'
     keyring_suffix = '_key'
 
-    def has_credential(self, name):
-        """
-        Check if there is a credential setting with the given name
-        :param name: plaintext setting name for the credential
-        :return: setting that was specified, or None if none was
-        """
-        scope = self.get_full_scope()
-        keyring_name = self.keyring_prefix + name + self.keyring_suffix
-        plaintext = self.get_string(name, True)
-        secure = self.get_string(keyring_name, True)
-        if plaintext and secure:
-            raise AssertionException('%s: cannot contain setting for both "%s" and "%s"' % (scope, name, keyring_name))
-        if plaintext is not None:
-            return name
-        elif secure is not None:
-            return keyring_name
-        else:
-            return None
-
-    def get_credential(self, name, user_name, none_allowed=False):
+    def get_credential(self, name, username, none_allowed=False):
         """
         Get the credential with the given name.  Raises an AssertionException if there
         is no credential, or if the credential is specified both in plaintext and the keyring.
         If the credential is kept in the keyring, the value of the keyring_name setting
         gives the secure storage key, and we fetch that key for the given user.
         :param name: setting name for the plaintext credential
-        :param user_name: the user for whom we should fetch the service name password in secure storage
+        :param username: the user for whom we should fetch the service name password in secure storage
         :param none_allowed: whether the credential can be missing or empty
         :return: credential string
         """
         keyring_name = self.keyring_prefix + name + self.keyring_suffix
         scope = self.get_full_scope()
         # sometimes the credential is in plain text
-        cleartext_value = self.get_string(name, True)
+        cleartext_value = self.get_value(name, (str, dict), True)
         # sometimes the value is in the keyring
         secure_value_key = self.get_string(keyring_name, True)
+        secure_dict_key = user_sync.credentials.CredentialConfig.parse_secure_key(cleartext_value)
         # but it has to be in exactly one of those two places!
         if not cleartext_value and not secure_value_key and not none_allowed:
             raise AssertionException('%s: must contain setting for "%s" or "%s"' % (scope, name, keyring_name))
         if cleartext_value and secure_value_key:
             raise AssertionException('%s: cannot contain setting for both "%s" and "%s"' % (scope, name, keyring_name))
         if secure_value_key:
+            identifier = secure_value_key
+        elif secure_dict_key:
+            identifier = secure_dict_key
+            username = user_sync.credentials.CredentialManager.username
+        else:
+            identifier = None
+        if identifier:
             try:
-                import keyring
-                value = keyring.get_password(service_name=secure_value_key, username=user_name)
+                from user_sync.credentials import CredentialManager
+                credman = CredentialManager()
+                logging.getLogger("credential_manager").info("Using keyring '{0}' to retrieve '{1}'"
+                                                             .format(credman.keyring_name, identifier))
+                value = credman.get(identifier, username)
+                if not value and not none_allowed:
+                    raise AssertionException(
+                        '%s: No value in secure storage for user "%s", key "%s"' % (scope, username, identifier))
             except Exception as e:
                 raise AssertionException('%s: Error accessing secure storage: %s' % (scope, e))
         else:
             value = cleartext_value
-        if not value and not none_allowed:
-            raise AssertionException(
-                '%s: No value in secure storage for user "%s", key "%s"' % (scope, user_name, secure_value_key))
         return value
 
 
@@ -844,6 +875,8 @@ class ConfigFileLoader:
                              '/directory_users/connectors/*': (True, False, None),
                              '/directory_users/extension': (True, False, None),
                              '/logging/file_log_directory': (False, False, "logs"),
+        '/post_sync/connectors/sign_sync': (False, False, False),
+        '/post_sync/connectors/future_feature': (False, False, False)
                              }
 
     # like ROOT_CONFIG_PATH_KEYS, but for non-root configuration files
@@ -883,7 +916,7 @@ class ConfigFileLoader:
     # key_path is being searched for in what file in what directory
     filepath = None  # absolute path of file currently being loaded
     filename = None  # filename of file currently being loaded
-    dirpath = None   # directory path of file currently being loaded
+    dirpath = None  # directory path of file currently being loaded
     key_path = None  # the full pathname of the setting key being processed
 
     @classmethod
@@ -903,45 +936,28 @@ class ConfigFileLoader:
                           the dictionary if there is not already a value found.
         """
         if filename.startswith('$(') and filename.endswith(')'):
-            # it's a command line to execute and read standard output
-            dir_end = filename.index(']')
-            if filename.startswith('$([') and dir_end > 0:
-                dir_name = filename[3:dir_end]
-                cmd_name = filename[dir_end + 1:-1]
-            else:
-                dir_name = os.path.abspath(".")
-                cmd_name = filename[3:-1]
-            try:
-                byte_string = subprocess.check_output(cmd_name, cwd=dir_name, shell=True)
+            raise AssertionException("Shell execution is no longer supported: {}".format(filename))
+
+        cls.filepath = os.path.abspath(filename)
+        if not os.path.isfile(cls.filepath):
+            raise AssertionException('No such configuration file: %s' % (cls.filepath,))
+        cls.filename = os.path.split(cls.filepath)[1]
+        cls.dirpath = os.path.dirname(cls.filepath)
+        try:
+            with open(filename, 'rb', 1) as input_file:
+                byte_string = input_file.read()
                 yml = yaml.safe_load(byte_string.decode(cls.config_encoding, 'strict'))
-            except subprocess.CalledProcessError as e:
-                raise AssertionException("Error executing process '%s' in dir '%s': %s" % (cmd_name, dir_name, e))
-            except UnicodeDecodeError as e:
-                raise AssertionException('Encoding error in process output: %s' % e)
-            except yaml.error.MarkedYAMLError as e:
-                raise AssertionException('Error parsing process YAML data: %s' % e)
-        else:
-            # it's a pathname to a configuration file to read
-            cls.filepath = os.path.abspath(filename)
-            if not os.path.isfile(cls.filepath):
-                raise AssertionException('No such configuration file: %s' % (cls.filepath,))
-            cls.filename = os.path.split(cls.filepath)[1]
-            cls.dirpath = os.path.dirname(cls.filepath)
-            try:
-                with open(filename, 'rb', 1) as input_file:
-                    byte_string = input_file.read()
-                    yml = yaml.safe_load(byte_string.decode(cls.config_encoding, 'strict'))
-            except IOError as e:
-                # if a file operation error occurred while loading the
-                # configuration file, swallow up the exception and re-raise it
-                # as an configuration loader exception.
-                raise AssertionException("Error reading configuration file '%s': %s" % (cls.filepath, e))
-            except UnicodeDecodeError as e:
-                # as above, but in case of encoding errors
-                raise AssertionException("Encoding error in configuration file '%s: %s" % (cls.filepath, e))
-            except yaml.error.MarkedYAMLError as e:
-                # as above, but in case of parse errors
-                raise AssertionException("Error parsing configuration file '%s': %s" % (cls.filepath, e))
+        except IOError as e:
+            # if a file operation error occurred while loading the
+            # configuration file, swallow up the exception and re-raise it
+            # as an configuration loader exception.
+            raise AssertionException("Error reading configuration file '%s': %s" % (cls.filepath, e))
+        except UnicodeDecodeError as e:
+            # as above, but in case of encoding errors
+            raise AssertionException("Encoding error in configuration file '%s: %s" % (cls.filepath, e))
+        except yaml.error.MarkedYAMLError as e:
+            # as above, but in case of parse errors
+            raise AssertionException("Error parsing configuration file '%s': %s" % (cls.filepath, e))
 
         # process the content of the dict
         if yml is None:
@@ -949,7 +965,7 @@ class ConfigFileLoader:
             yml = {}
         elif not isinstance(yml, dict):
             # malformed YML files produce a non-dictionary
-            raise AssertionException("Configuration file '%s' does not contain settings" % cls.filepath)
+            raise AssertionException("Configuration file or command '%s' does not contain settings" % cls.filepath)
         for path_key, options in six.iteritems(path_keys):
             cls.key_path = path_key
             keys = path_key.split('/')
