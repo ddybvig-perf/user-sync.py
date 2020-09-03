@@ -1,6 +1,8 @@
 import pytest
 import six
+# import keyring
 
+from sign_client.client import SignClient
 from user_sync.connector.directory import DirectoryConnector
 from user_sync.engine.sign import SignSyncEngine
 
@@ -30,3 +32,25 @@ def test_load_users_and_groups(example_engine, example_user):
     dc.load_users_and_groups = dir_user_replacement
     directory_users = example_engine.read_desired_user_groups({'directory_group': 'adobe_group'}, dc)
     assert directory_users is not None
+
+
+def test_sign_client(sign_config_file):
+    client_config = {
+        'console_org': None,
+        'host': 'api.na2.echosignstage.com',
+        'key': 'allsortsofgibberish1234567890',
+        'admin_email': 'brian.nickila@gmail.com'
+    }
+    sign_client = SignClient(client_config)
+    assert sign_client.key == client_config['key']
+    # this next line works...but then causes the keyring import in config.get credential to fail and thus use
+    # cryptfile instead, which in turn causes the test to fail. workaround is to run once, then comment out
+    # keyring.set_password('sign_key', client_config['admin_email'], client_config['key'])
+    secure_client_config = {
+        'console_org': None,
+        'host': 'api.na2.echosignstage.com',
+        'secure_key_key': 'sign_key',
+        'admin_email': 'brian.nickila@gmail.com'
+    }
+    sign_client = SignClient(secure_client_config)
+    assert sign_client.key == client_config['key']

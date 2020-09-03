@@ -2,18 +2,23 @@ import logging
 import requests
 import json
 from user_sync.error import AssertionException
+from user_sync.config.common import DictConfig
 
 
 class SignClient:
     version = 'v5'
     _endpoint_template = 'api/rest/{}/'
+    name = 'sign'
 
     def __init__(self, config, logger=None):
         for k in ['host', 'key', 'admin_email']:
-            if k not in config:
+            if k not in config and k != 'key':
                 raise AssertionException("Key '{}' must be specified for all Sign orgs".format(k))
+            if k not in config and 'secure_key_key' not in config:
+                raise AssertionException("Must specify key in either plaintext or secure format.")
+        dc = DictConfig("<%s>" % self.name, config)
         self.host = config['host']
-        self.key = config['key']
+        self.key = dc.get_credential('key', config['admin_email'])
         self.admin_email = config['admin_email']
         self.api_url = None
         self.groups = None
