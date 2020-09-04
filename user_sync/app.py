@@ -51,6 +51,7 @@ import user_sync.post_sync.connectors.sign_sync
 import user_sync.resource
 import user_sync.engine.umapi
 import user_sync.config.user_sync
+import user_sync.config.sign_sync
 import user_sync.connector.connector_umapi
 from user_sync.error import AssertionException
 from user_sync.post_sync.manager import PostSyncManager
@@ -172,10 +173,42 @@ def main():
               help='user attributes on the Adobe side are updated from the directory.')
 def sync(**kwargs):
     """Run User Sync [default command]"""
-    run_stats = None
     sign_config_file = kwargs.get('sign_sync_config')
     if 'sign_sync_config' in kwargs:
         del(kwargs['sign_sync_config'])
+    run_sync(config.ConfigLoader(kwargs), begin_work_umapi)
+
+
+@main.command()
+@click.help_option('-h', '--help')
+@click.option('-c', '--config-filename',
+                help = "path to your main configuration file",
+                type = str,
+                nargs = 1,
+                metavar = 'path-to-file')     #default should be sign-sync-config.yml
+@click.option('--users',
+              help="specify the users to be considered for sync. Legal values are 'all' (the default), "
+                   "'group names' (a comma-separated list of groups in the enterprise "
+                   "directory, and only users in those groups are selected), 'mapped' (all groups listed in "
+                   "the configuration file).",
+              cls=user_sync.cli.OptionMulti,
+              type=list,
+              metavar='all|mapped|group [group list or path-to-file.csv]') #default should mapped
+@click.option('--sign-only-user-action',
+              help="specify what action to take on Sign users that don't match users from the "
+                   "directory.  Options are 'exclude' (from all changes), "
+                   "'delete' (users and their cloud storage), and default perserve (no action taken) ",
+              cls=user_sync.cli.OptionMulti,
+              type=list,
+              metavar='exclude|preserve|delete')
+def sign_sync(**kwargs):
+    """Run Sign Sync """
+    #load the config files (sign-sync-config.yml) and start the file logger
+    run_sync(sign_sync.SignConfigLoader(kwargs), begin_work_sign)
+
+
+def run_sync(config_loader, begin_work):
+    run_stats = None
     try:
         # load the config files and start the file logger
         config_loader = config.UMAPIConfigLoader(kwargs)
@@ -450,7 +483,7 @@ def log_parameters(argv, config_loader):
     logger.info('-------------------------------------')
 
 
-def begin_work(config_loader):
+def begin_work_umapi(config_loader):
     """
     :type config_loader: config.UMAPIConfigLoader
     """
@@ -468,14 +501,6 @@ def begin_work(config_loader):
     referenced_umapi_names.difference_update(six.iterkeys(secondary_umapi_configs))
     if len(referenced_umapi_names) > 0:
         raise AssertionException('Adobe groups reference unknown umapi connectors: %s' % referenced_umapi_names)
-
-    directory_connector = None
-    directory_connector_options = None
-    directory_connector_module_name = config_loader.get_directory_connector_module_name()
-    if directory_connector_module_name is not None:
-        directory_connector_module = __import__(directory_connector_module_name, fromlist=[''])
-        directory_connector = user_sync.connector.directory.DirectoryConnector(directory_connector_module)
-        directory_connector_options = config_loader.get_directory_connector_options(directory_connector.name)
 
     post_sync_manager = None
     # get post-sync config unconditionally so we don't get an 'unused key' error
@@ -506,6 +531,7 @@ def begin_work(config_loader):
         if additional_group_filters and directory_connector.state.options['dynamic_group_member_attribute'] is None:
             raise AssertionException(
                 "Failed to enable dynamic group mappings. 'dynamic_group_member_attribute' is not defined in config")
+
     primary_name = '.primary' if secondary_umapi_configs else ''
     umapi_primary_connector = UmapiConnector(primary_name, primary_umapi_config)
     umapi_other_connectors = {}
