@@ -46,6 +46,8 @@ from user_sync.connector.connector_umapi import UmapiConnector
 from user_sync.engine import umapi as rules
 from user_sync.engine.common import PRIMARY_TARGET_NAME
 
+from user_sync.credentials import CredentialManager
+from user_sync.error import AssertionException
 from user_sync.post_sync.manager import PostSyncManager
 import user_sync.post_sync.connectors.sign_sync
 import user_sync.resource
@@ -61,6 +63,14 @@ LOG_DATE_FORMAT = '%Y-%m-%d %H:%M:%S'
 
 # file logger, defined early so later functions can refer to it.
 logger = logging.getLogger('main')
+
+
+def init_cli_logger():
+    # Removes the LOG_STRING_FORMAT and LOG_DATE_FORMAT from the logger
+    # so that additional tools like credential manager can produce uniform output
+    # along side click I/O. Console log level is INFO by default, but can be overwritten in user_sync_config.yml
+    logging.getLogger().handlers[0].setFormatter(logging.Formatter('', ''))
+    logging.getLogger().setLevel(logging.INFO)
 
 
 def init_console_log():
@@ -175,7 +185,7 @@ def sync(**kwargs):
     run_stats = None
     sign_config_file = kwargs.get('sign_sync_config')
     if 'sign_sync_config' in kwargs:
-        del(kwargs['sign_sync_config'])
+        del (kwargs['sign_sync_config'])
     try:
         # load the config files and start the file logger
         config_loader = config.UMAPIConfigLoader(kwargs)
