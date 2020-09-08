@@ -15,6 +15,7 @@ class SignSyncEngine:
     default_options = {
         'admin_roles': None,
         'create_users': False,
+        'deactivate_sign_only_users': False,
         'directory_group_filter': None,
         'entitlement_groups': [],
         'identity_types': [],
@@ -52,7 +53,7 @@ class SignSyncEngine:
         # options = builder.get_options()
 
         sign_orgs = sync_config.get_list('sign_orgs')
-        self.connectors = {cfg.get('console_org'): SignConnector(cfg) for cfg in sign_orgs}
+        self.connectors = {cfg.get('primary'): SignConnector(cfg) for cfg in sign_orgs}
         self.create_new_users = sync_config.get_bool("create_new_users")
 
     def run(self, directory_groups, directory_connector):
