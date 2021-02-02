@@ -77,6 +77,24 @@ detailed in the next two sections.
 
 Refer to the (URL to Additional Tools)
 
+connector-umapi.yml
+
+	server:
+	
+	enterprise:
+	  org_id: your org id
+	  secure_client_id_key: client_id
+	  secure_client_secret_key: umapi_client_secret
+	  tech_acct_id: your tech account@techacct.adobe.com
+	  secure_priv_key_data_key: umapi_private_key_data
+
+Note the change of `client_id`, `client_secret`, and `priv_key_path` to `secure_client_id_key`, `secure_client_secret_key`, and `secure_priv_key_data_key`, respectively.  These alternate configuration values give the key names to be looked up in the user keychain (or the equivalent service on other platforms) to retrieve the actual credential values.  In this example, the credential key names are `umapi_client_id`, `umapi_client_secret`, and `umapi_private_key_data`.
+
+The contents of the private key file is used as the value of `umapi_private_key_data` in the credential store.  This can only be done on platforms other than Windows.  See below for how to secure the
+private key file on Windows.
+
+The credential values will be looked up in the secure store using org_id as the username value and the key names in the config file as the key name.
+
 A slight variant on this approach is available (in User Sync version 2.1.1 or later) to encrypt the
 private key file using the standard RSA encrypted representation for private keys (known as the
 PKCS#8 format).  This approach must be used on Windows because the Windows secure store is not
@@ -98,10 +116,10 @@ Next, uncomment the line Priv_key_pass. The value must be the password for decry
 	
 	enterprise:
 	  org_id: your org id
-	  api_key: umapi_api_key
-	  client_secret: umapi_client_secret
-	  tech_acct: your tech account@techacct.adobe.com
-	  priv_key_pass: umapi_private_key_passphrase
+	  secure_client_id_key: umapi_client_id
+	  secure_client_secret_key: umapi_client_secret
+	  tech_acct_id: your tech account@techacct.adobe.com
+	  secure_priv_key_pass_key: umapi_private_key_passphrase
 	  priv_key_path: private-encrypted.key
 
 This passphrase can be saved using crendential store command
